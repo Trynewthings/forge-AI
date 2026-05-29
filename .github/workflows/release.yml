@@ -111,10 +111,11 @@ jobs:
           mkdir "${DIR}"
           cp rust/target/release/claw-server "${DIR}/forge"
           chmod +x "${DIR}/forge"
-          # Reuse the README that ships alongside the binary. We keep a
-          # canonical copy in the repo so it travels with every artifact.
-          cp dist/forge-v0.1.0-darwin-arm64/README.txt "${DIR}/README.txt" 2>/dev/null \
-            || echo "README missing — staging without it" >&2
+          # Canonical end-user README that ships in every release zip.
+          # Tracked at release-assets/README.txt so the workflow can rely
+          # on it being present in any tag's checkout (vs. the .gitignored
+          # local dist/ staging dir which only exists on the dev machine).
+          cp release-assets/README.txt "${DIR}/README.txt"
           if [ "${{ matrix.archive-ext }}" = "zip" ]; then
             zip -r "${DIR}.zip" "${DIR}/"
           else
