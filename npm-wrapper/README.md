@@ -7,7 +7,7 @@ never leaves it.
 ## Install & run
 
 ```bash
-npx @forge-ai/forge --open
+npx @theforge-ai/forge --open
 ```
 
 That's it. First run downloads the matching binary (~20 MB) into
@@ -19,7 +19,7 @@ Subsequent runs skip the download.
 Or install globally so you can just type `forge-ai`:
 
 ```bash
-npm i -g @forge-ai/forge
+npm i -g @theforge-ai/forge
 forge-ai --open
 ```
 
@@ -66,7 +66,7 @@ forge-ai --host 0.0.0.0      # expose on LAN (NOT recommended)
 ## Updating
 
 ```bash
-npx @forge-ai/forge@latest --open
+npx @theforge-ai/forge@latest --open
 ```
 
 To clear the cached binary for a version:

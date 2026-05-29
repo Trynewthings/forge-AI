@@ -1,7 +1,7 @@
 {
-  "name": "@forge-ai/forge",
+  "name": "@theforge-ai/forge",
   "version": "0.1.0",
-  "description": "Forge.ai — local coding agent. `npx @forge-ai/forge` to run.",
+  "description": "Forge.ai — local coding agent. `npx @theforge-ai/forge` to run.",
   "bin": {
     "forge-ai": "bin/forgeai.js"
   },
