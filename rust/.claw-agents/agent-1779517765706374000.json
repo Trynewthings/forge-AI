@@ -1,0 +1,14 @@
+{
+  "agentId": "agent-1779517765706374000",
+  "name": "ship-audit",
+  "description": "Review the branch",
+  "subagentType": "general-purpose",
+  "model": "claude-opus-4-6",
+  "status": "failed",
+  "outputFile": "/Users/llk/claudeCodePython/claw-code-main/rust/.claw-agents/agent-1779517765706374000.md",
+  "manifestFile": "/Users/llk/claudeCodePython/claw-code-main/rust/.claw-agents/agent-1779517765706374000.json",
+  "createdAt": "1779517765",
+  "startedAt": "1779517765",
+  "completedAt": "1779517765",
+  "error": "missing Claw credentials; export ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY before calling the Claw API"
+}

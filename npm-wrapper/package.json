@@ -1,0 +1,32 @@
+{
+  "name": "forgeai",
+  "version": "0.1.0",
+  "description": "Forge.ai — local coding agent. `npx forgeai` to run.",
+  "bin": {
+    "forgeai": "bin/forgeai.js"
+  },
+  "scripts": {
+    "test": "echo 'no tests'"
+  },
+  "files": [
+    "bin/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "coding",
+    "llm",
+    "claude",
+    "deepseek"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Trynewthings/forge-AI"
+  },
+  "homepage": "https://github.com/Trynewthings/forge-AI"
+}

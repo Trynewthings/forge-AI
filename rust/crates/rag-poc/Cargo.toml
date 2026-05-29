@@ -1,0 +1,31 @@
+[package]
+name = "rag-poc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# sqlite-vec ships an auto-loadable extension; the Rust crate links it
+# statically so we don't need to fetch a `.dylib` separately. rusqlite is
+# the standard SQLite wrapper.
+rusqlite = { version = "0.32", features = ["bundled"] }
+sqlite-vec = "0.1"
+zerocopy = "0.7"
+
+[[bin]]
+name = "rag-poc"
+path = "src/main.rs"
+
+# Inherit clippy lints from the workspace, but override the workspace-wide
+# `unsafe_code = "forbid"` because sqlite-vec's `sqlite3_auto_extension`
+# registration needs one tiny `unsafe` block at startup.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_panics_doc = "allow"
+missing_errors_doc = "allow"

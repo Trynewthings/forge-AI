@@ -1,0 +1,34 @@
+__pycache__/
+archive/
+.omx/
+.clawd-agents/
+# Claude Code local artifacts
+.claude/settings.local.json
+.claude/sessions/
+
+# macOS junk
+.DS_Store
+
+# Editor / IDE session state
+.port_sessions/
+.idea/
+.vscode/
+
+# Release staging — built artifacts from `cargo build --release` get
+# zipped here for distribution. They're large (~8 MB each) and CI
+# rebuilds them on every tag; no reason to track them.
+/dist/
+
+# Local agent-runtime state (not part of the source)
+.sandbox-home/
+.sandbox-tmp/
+.claw-todos.json
+
+# Server / persistence state — written at runtime to user's HOME or
+# project workspace; never source-control these.
+.claw/
+
+# Node deps inside the npm wrapper, if someone runs `npm install` there
+# to test locally
+npm-wrapper/node_modules/
+npm-wrapper/package-lock.json

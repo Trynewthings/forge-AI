@@ -1,0 +1,25 @@
+[package]
+name = "vecdb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+sqlite-vec = "0.1"
+zerocopy = "0.7"
+
+# Workspace forbids unsafe across the project, but sqlite-vec needs a tiny
+# `unsafe` block to register its loadable extension with libsqlite3 — a
+# C-FFI shim that's idiomatic for ext-loading and properly encapsulated
+# in `init_once()`. The rest of the crate is safe Rust.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_panics_doc = "allow"
+missing_errors_doc = "allow"

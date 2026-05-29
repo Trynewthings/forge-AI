@@ -1,0 +1,45 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+api = { path = "../api" }
+async-stream = "0.3"
+axum = { version = "0.8", features = ["multipart"] }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+commands = { path = "../commands" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+pdf-extract = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+runtime = { path = "../runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "net", "time", "signal"] }
+tools = { path = "../tools" }
+# Safe wrapper around sqlite-vec — keeps the one `unsafe` block out of
+# the server crate so `unsafe_code = forbid` remains in force here.
+vecdb = { path = "../vecdb" }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Embeds the Vite-built frontend (frontend/dist) inside the server
+# binary so the whole product ships as a single executable. The macro
+# walks the folder at compile time — if the folder is missing or empty
+# the build still works (just yields a server with no UI, useful for
+# pure API testing). See serve_embedded_spa() in lib.rs.
+rust-embed = { version = "8", features = ["mime-guess"] }
+
+[[bin]]
+name = "claw-server"
+path = "src/bin/claw_server.rs"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+tempfile = "3"
+
+[lints]
+workspace = true
