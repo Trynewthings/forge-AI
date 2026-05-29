@@ -53,12 +53,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Both Mac targets share the macos-14 (arm64) runner. macos-13
+          # (Intel) on free public repos has tiny capacity and routinely
+          # queues for hours; cross-compiling x86_64 from the arm64 host
+          # is well-supported by Apple's toolchain (just `rustup target
+          # add` and `--target`) and ships the same binary in 1/10th the
+          # wait time.
           - target: darwin-arm64
-            runs-on: macos-14            # GH's M1/M2 runner
+            runs-on: macos-14
             rust-target: aarch64-apple-darwin
             archive-ext: zip
           - target: darwin-x86_64
-            runs-on: macos-13            # GH's Intel runner
+            runs-on: macos-14
             rust-target: x86_64-apple-darwin
             archive-ext: zip
           - target: linux-x86_64
@@ -69,9 +75,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The Rust toolchain ships with the runner's native target; we
-      # don't need cross-compilation since each matrix entry runs on
-      # its own native runner.
+      # Ensure the requested Rust target is installed. Native is already
+      # there for the runner's arch; cross targets (darwin x86_64 on the
+      # arm64 host) need `rustup target add`.
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.rust-target }}
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -93,7 +102,7 @@ jobs:
 
       - name: Build release binary
         working-directory: rust
-        run: cargo build --release --bin claw-server
+        run: cargo build --release --bin claw-server --target ${{ matrix.rust-target }}
 
       # Two archive formats: macOS users get a familiar .zip (Finder
       # double-click extracts it); Linux users get .tar.gz preserving
@@ -109,7 +118,10 @@ jobs:
           fi
           DIR="forge-v${VERSION}-${{ matrix.target }}"
           mkdir "${DIR}"
-          cp rust/target/release/claw-server "${DIR}/forge"
+          # `--target` puts the binary under target/<triple>/release/ —
+          # always source from there even for the host-arch build so the
+          # path stays uniform across matrix entries.
+          cp rust/target/${{ matrix.rust-target }}/release/claw-server "${DIR}/forge"
           chmod +x "${DIR}/forge"
           # Canonical end-user README that ships in every release zip.
           # Tracked at release-assets/README.txt so the workflow can rely
