@@ -7,7 +7,7 @@ never leaves it.
 ## Install & run
 
 ```bash
-npx forgeai --open
+npx @forge-ai/forge --open
 ```
 
 That's it. First run downloads the matching binary (~20 MB) into
@@ -15,6 +15,16 @@ That's it. First run downloads the matching binary (~20 MB) into
 `http://localhost:8787` in your browser.
 
 Subsequent runs skip the download.
+
+Or install globally so you can just type `forge-ai`:
+
+```bash
+npm i -g @forge-ai/forge
+forge-ai --open
+```
+
+(The CLI command is `forge-ai` — not plain `forge` — to avoid the
+common collision with Foundry's `forge` Ethereum dev tool.)
 
 ## What you'll see
 
@@ -39,11 +49,11 @@ once you trust the setup.
 ## Flags
 
 ```
-forgeai --help              # show all flags
-forgeai --open              # auto-open browser
-forgeai --port 0            # auto-pick a free port
-forgeai --port 4000         # bind to a specific port
-forgeai --host 0.0.0.0      # expose on LAN (NOT recommended)
+forge-ai --help              # show all flags
+forge-ai --open              # auto-open browser
+forge-ai --port 0            # auto-pick a free port
+forge-ai --port 4000         # bind to a specific port
+forge-ai --host 0.0.0.0      # expose on LAN (NOT recommended)
 ```
 
 ## State
@@ -56,7 +66,7 @@ forgeai --host 0.0.0.0      # expose on LAN (NOT recommended)
 ## Updating
 
 ```bash
-npx forgeai@latest --open
+npx @forge-ai/forge@latest --open
 ```
 
 To clear the cached binary for a version:

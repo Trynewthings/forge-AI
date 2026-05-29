@@ -1,9 +1,9 @@
 {
-  "name": "forgeai",
+  "name": "@forge-ai/forge",
   "version": "0.1.0",
-  "description": "Forge.ai — local coding agent. `npx forgeai` to run.",
+  "description": "Forge.ai — local coding agent. `npx @forge-ai/forge` to run.",
   "bin": {
-    "forgeai": "bin/forgeai.js"
+    "forge-ai": "bin/forgeai.js"
   },
   "scripts": {
     "test": "echo 'no tests'"
