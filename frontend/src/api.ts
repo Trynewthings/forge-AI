@@ -1,5 +1,6 @@
 import type {
   AttachmentRef,
+  BrowserState,
   CancelTurnResponse,
   CommandsResponse,
   CompactSessionResponse,
@@ -303,6 +304,7 @@ export async function decidePermission(
   requestId: string,
   allowed: boolean,
   reason: string | null = null,
+  remember = false,
 ): Promise<void> {
   const response = await fetch(
     `${BASE}/sessions/${encodeURIComponent(sessionId)}/permissions/${encodeURIComponent(
@@ -311,7 +313,7 @@ export async function decidePermission(
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ allowed, reason }),
+      body: JSON.stringify({ allowed, reason, remember }),
     },
   );
   if (!response.ok) {
@@ -408,6 +410,11 @@ export async function setMcpServerEnabled(
 
 export async function fetchMcpPresets(): Promise<McpPresetsResponse> {
   return jsonOrThrow(await fetch(`${BASE}/mcp/presets`));
+}
+
+/** Live Browser-pane observation snapshot (screenshot + URL + DOM snapshot). */
+export async function fetchBrowserState(): Promise<BrowserState> {
+  return jsonOrThrow(await fetch(`${BASE}/browser/state`));
 }
 
 export async function checkPresetPrereqs(

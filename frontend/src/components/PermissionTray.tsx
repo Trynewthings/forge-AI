@@ -12,7 +12,7 @@ export interface PendingPermission {
 interface Props {
   pending: PendingPermission[];
   decidingId: string | null;
-  onDecide: (requestId: string, allowed: boolean) => Promise<void>;
+  onDecide: (requestId: string, allowed: boolean, remember?: boolean) => Promise<void>;
 }
 
 /** Floating tray rendered between the chat scroller and ChatInput when
@@ -79,7 +79,7 @@ function PermissionRow({
 }: {
   entry: PendingPermission;
   busy: boolean;
-  onDecide: (requestId: string, allowed: boolean) => Promise<void>;
+  onDecide: (requestId: string, allowed: boolean, remember?: boolean) => Promise<void>;
 }) {
   const [expanded, setExpanded] = useState(false);
   const formattedInput = useMemo(() => {
@@ -193,6 +193,24 @@ function PermissionRow({
           }}
         >
           {busy ? "…" : "Allow"}
+        </button>
+        <button
+          onClick={() => onDecide(entry.requestId, true, true)}
+          disabled={busy}
+          title="Approve and stop asking for this command for the rest of the session"
+          style={{
+            padding: "5px 14px",
+            borderRadius: 6,
+            fontSize: 12,
+            fontWeight: 600,
+            background: "var(--ok-soft, var(--accent-soft))",
+            color: "var(--ok)",
+            border: "1px solid var(--ok)",
+            opacity: busy ? 0.6 : 1,
+            cursor: busy ? "wait" : "pointer",
+          }}
+        >
+          Allow always
         </button>
         <button
           onClick={() => onDecide(entry.requestId, false)}

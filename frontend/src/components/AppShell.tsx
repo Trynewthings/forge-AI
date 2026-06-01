@@ -13,6 +13,7 @@ import {
   fetchSkills,
   fetchTools,
   getSession,
+  installMcpPreset,
   listSessions,
   patchConfig,
   pickAttachmentFile,
@@ -143,6 +144,14 @@ export default function AppShell() {
       console.error("fetchMcpServers failed", err);
     }
   }, []);
+
+  /** One-click install of the built-in browser (Playwright-MCP) preset, then
+   *  refresh the server list so the Browser pane flips to "installed". Rejects
+   *  on failure so the pane can surface the message inline. */
+  const installBrowser = useCallback(async () => {
+    await installMcpPreset("browser", { name: "browser", inputs: {} });
+    await refreshMcpServers();
+  }, [refreshMcpServers]);
 
   // ----- composer / UI state -----
   const [composer, setComposer] = useState("");
@@ -317,6 +326,11 @@ export default function AppShell() {
     if (totalCount < processedRef.current) processedRef.current = 0;
     let needsRefresh = false;
     let dropOptimisticAfterRefresh = false;
+    // When the server replaces history (e.g. /compact shrinks the message
+    // count), local bubbles anchored past the new end would otherwise clamp
+    // to the bottom and re-float after every new message. Track the snapshot's
+    // new length so we can drop those stale bubbles after the refresh.
+    let pruneLocalBeyond: number | null = null;
     const newCount = Math.min(totalCount - processedRef.current, events.length);
     const startIndex = events.length - newCount;
     for (let i = startIndex; i < events.length; i++) {
@@ -354,6 +368,9 @@ export default function AppShell() {
           break;
         case "session_snapshot":
           needsRefresh = true;
+          // The snapshot carries the authoritative post-replace history, so
+          // its length is the new valid anchor ceiling. Last snapshot wins.
+          pruneLocalBeyond = evt.session.messages.length;
           break;
         case "turn_finished":
           setTurnState((c) => (c === "error" ? "error" : "idle"));
@@ -434,6 +451,12 @@ export default function AppShell() {
       if (dropOptimisticAfterRefresh) {
         refreshed
           .then(() => mutateActiveLocal((p) => p.filter((e) => !e.optimistic)))
+          .catch(() => {});
+      }
+      if (pruneLocalBeyond !== null) {
+        const keepThrough = pruneLocalBeyond;
+        refreshed
+          .then(() => mutateActiveLocal((p) => p.filter((e) => e.anchor <= keepThrough)))
           .catch(() => {});
       }
       refreshSessions();
@@ -523,6 +546,28 @@ export default function AppShell() {
     [activeId, sessions, refreshSessions, absorbTarget, absorbSources],
   );
 
+  /** Pre-flight check before dispatching a real LLM turn. Returns a
+   *  user-facing reason to block, or null when good to send. Catches the
+   *  two common new-user dead-ends (no model picked, or the picked model's
+   *  provider has no API key) up front, instead of letting the turn fail at
+   *  the backend after a round-trip. Slash commands skip this — they don't
+   *  hit the model. */
+  const sendBlockReason = useCallback((): string | null => {
+    const model = config?.model;
+    if (!model) {
+      return "Pick a model first — open the Models tab on the right.";
+    }
+    // Best-effort: find the provider(s) whose catalog lists this model. Block
+    // only when the model is known AND none of its providers has a key — that
+    // avoids false positives for models shared across providers. A custom/typed
+    // model (in no catalog) falls through to the backend credential check.
+    const owners = providers.filter((p) => p.models.includes(model));
+    if (owners.length > 0 && !owners.some((p) => p.configured)) {
+      return `Add an API key for ${owners[0].label} in Settings before sending.`;
+    }
+    return null;
+  }, [config, providers]);
+
   const handleSend = useCallback(async () => {
     if (!activeId || sending) return;
     if (!composer.trim() && composerAttachments.length === 0) return;
@@ -608,6 +653,14 @@ export default function AppShell() {
       // unknown slash command — fall through, treat as a regular message
     }
 
+    // Real turn ahead — make sure a model + provider key are in place so the
+    // user gets an actionable message now rather than a backend error later.
+    const blockReason = sendBlockReason();
+    if (blockReason) {
+      setError(blockReason);
+      return;
+    }
+
     const text = composer;
     const attachments = composerAttachments;
     const optimistic: ConversationMessage = {
@@ -650,12 +703,20 @@ export default function AppShell() {
     mutateActiveLocal,
     mutateLocalFor,
     createInheritingSession,
+    sendBlockReason,
   ]);
 
   // ----- hero submit (no active session yet) -----
   const handleHeroSubmit = useCallback(async () => {
     if (creatingFromHero) return;
     if (!composer.trim() && composerAttachments.length === 0) return;
+    // Block before spinning up a session so a missing model/key doesn't
+    // leave an empty orphan session behind.
+    const blockReason = sendBlockReason();
+    if (blockReason) {
+      setError(blockReason);
+      return;
+    }
     const text = composer;
     const attachments = composerAttachments;
     setError(null);
@@ -695,7 +756,7 @@ export default function AppShell() {
     } finally {
       setCreatingFromHero(false);
     }
-  }, [composer, composerAttachments, creatingFromHero, refreshSessions, createInheritingSession, heroPendingLibrary]);
+  }, [composer, composerAttachments, creatingFromHero, refreshSessions, createInheritingSession, heroPendingLibrary, sendBlockReason]);
 
   // When the just-created session becomes active, dispatch the first
   // message and seed the optimistic bubble. Runs after the session-switch
@@ -841,11 +902,11 @@ export default function AppShell() {
   }, [absorbTarget, activeId, refreshActive]);
 
   const handleDecidePermission = useCallback(
-    async (requestId: string, allowed: boolean) => {
+    async (requestId: string, allowed: boolean, remember = false) => {
       if (!activeId) return;
       setDecidingPermissionId(requestId);
       try {
-        await decidePermission(activeId, requestId, allowed);
+        await decidePermission(activeId, requestId, allowed, null, remember);
         // Optimistically drop from local state — the SSE
         // `permission_decision` event will arrive shortly and is a no-op
         // (already-filtered list), but waiting for it makes the buttons
@@ -1106,7 +1167,13 @@ export default function AppShell() {
             background: "var(--bg)",
           }}
         >
-          <RightPanel config={config} tools={tools} />
+          <RightPanel
+            config={config}
+            tools={tools}
+            mcpServers={mcpServers}
+            onInstallBrowser={installBrowser}
+            turnActive={turnState === "running"}
+          />
         </div>
       )}
 

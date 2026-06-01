@@ -10,7 +10,7 @@ mod static_assets;
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -145,6 +145,12 @@ pub struct AppState {
     /// RAG library store — sqlite-vec-backed knowledge bases the user can
     /// attach to a session for auto-retrieval before each turn.
     library_store: rag::LibraryStore,
+    /// Live permission mode shared with in-flight turns. A turn's
+    /// `PermissionPolicy` reads this atomic before each tool call, so a
+    /// PATCH /config mode change takes effect at the next tool boundary
+    /// instead of only on the following turn. Kept in sync with
+    /// `config.permission_mode` by the PATCH /config handler.
+    permission_mode: Arc<AtomicU8>,
 }
 
 impl AppState {
@@ -226,6 +232,9 @@ impl AppState {
             .as_ref()
             .map(|p| p.dimensions as usize)
             .unwrap_or(rag::DEFAULT_EMBEDDING_DIM);
+        let initial_permission_mode = parse_permission_mode(&config.permission_mode)
+            .unwrap_or(PermissionMode::Prompt)
+            .as_u8();
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             next_session_id: Arc::new(AtomicU64::new(1)),
@@ -249,6 +258,7 @@ impl AppState {
                 rag::LibraryStore::default_root(),
                 embedding_dim,
             ),
+            permission_mode: Arc::new(AtomicU8::new(initial_permission_mode)),
         }
     }
 
@@ -361,6 +371,92 @@ impl AppState {
             mcp_servers,
         }
     }
+
+    /// Directory for per-session files, or `None` when persistence is
+    /// disabled (`CLAW_SERVER_STATE_PATH` empty / unset).
+    fn sessions_dir(&self) -> Option<PathBuf> {
+        self.persist_path
+            .as_ref()
+            .map(|path| persistence::sessions_dir(path))
+    }
+
+    /// Snapshot one session to disk. No-op when persistence is off or the
+    /// session is gone. The blocking write runs off the async executor and
+    /// failures are logged, never propagated — a persistence hiccup must
+    /// not fail the user's turn.
+    async fn persist_session(&self, id: &SessionId) {
+        let Some(dir) = self.sessions_dir() else {
+            return;
+        };
+        let persisted = {
+            let sessions = self.sessions.read().await;
+            let Some(session) = sessions.get(id) else {
+                return;
+            };
+            session.to_persisted()
+        };
+        let outcome =
+            tokio::task::spawn_blocking(move || persistence::save_session(&dir, &persisted)).await;
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, session = %id, "failed to persist session"),
+            Err(error) => tracing::warn!(%error, session = %id, "session persist task panicked"),
+        }
+    }
+
+    /// Delete a session's on-disk file. No-op when persistence is off.
+    async fn forget_session(&self, id: &SessionId) {
+        let Some(dir) = self.sessions_dir() else {
+            return;
+        };
+        let id_owned = id.clone();
+        let outcome =
+            tokio::task::spawn_blocking(move || persistence::delete_session(&dir, &id_owned)).await;
+        if let Ok(Err(error)) = outcome {
+            tracing::warn!(%error, session = %id, "failed to delete persisted session");
+        }
+    }
+
+    /// Load persisted sessions from disk into the in-memory store at
+    /// startup, and bump `next_session_id` past the highest restored id so
+    /// freshly created sessions don't collide. No-op when persistence is
+    /// off or no session files exist.
+    pub async fn restore_persisted_sessions(&self) {
+        let Some(dir) = self.sessions_dir() else {
+            return;
+        };
+        let restored =
+            match tokio::task::spawn_blocking(move || persistence::load_sessions(&dir)).await {
+                Ok(list) => list,
+                Err(error) => {
+                    tracing::warn!(%error, "session restore task panicked");
+                    return;
+                }
+            };
+        if restored.is_empty() {
+            return;
+        }
+        let count = restored.len();
+        let mut max_id = 0u64;
+        {
+            let mut sessions = self.sessions.write().await;
+            for persisted in restored {
+                if let Some(n) = persisted
+                    .id
+                    .strip_prefix("session-")
+                    .and_then(|suffix| suffix.parse::<u64>().ok())
+                {
+                    max_id = max_id.max(n);
+                }
+                let session = Session::from_persisted(persisted);
+                sessions.insert(session.id.clone(), session);
+            }
+        }
+        if max_id >= self.next_session_id.load(Ordering::Relaxed) {
+            self.next_session_id.store(max_id + 1, Ordering::Relaxed);
+        }
+        tracing::info!(count, "restored persisted sessions");
+    }
 }
 
 impl Default for AppState {
@@ -393,6 +489,13 @@ pub struct Session {
     /// the only way to bring a long-running turn to a clean stop.
     /// Reset to `false` whenever a new turn starts.
     pub cancel_signal: Arc<AtomicBool>,
+    /// "Allow always" approvals the user granted this session. Each key is a
+    /// command prefix (`bash:<program>`) or a tool name; a permission prompt
+    /// whose key is present is auto-approved instead of re-asking. Shared via
+    /// Arc<Mutex> so the in-turn `ServerPrompter` reads it and the HTTP
+    /// decision handler writes it. In-memory only — deliberately NOT persisted,
+    /// so approvals reset on restart.
+    pub allow_rules: Arc<StdMutex<std::collections::BTreeSet<String>>>,
 }
 
 impl Session {
@@ -407,6 +510,44 @@ impl Session {
             attached_mcps: Arc::new(StdMutex::new(std::collections::BTreeSet::new())),
             attached_library: Arc::new(StdMutex::new(None)),
             cancel_signal: Arc::new(AtomicBool::new(false)),
+            allow_rules: Arc::new(StdMutex::new(std::collections::BTreeSet::new())),
+        }
+    }
+
+    /// Rebuild a session from its on-disk form. The broadcast channel,
+    /// turn handle, and cancel flag are runtime-only and recreated fresh —
+    /// a restored session is never mid-turn.
+    fn from_persisted(persisted: persistence::PersistedSession) -> Self {
+        let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
+        Self {
+            id: persisted.id,
+            created_at: persisted.created_at,
+            conversation: persisted.conversation,
+            events,
+            current_turn: None,
+            attached_mcps: Arc::new(StdMutex::new(persisted.attached_mcps)),
+            attached_library: Arc::new(StdMutex::new(persisted.attached_library)),
+            cancel_signal: Arc::new(AtomicBool::new(false)),
+            // Allow-always approvals are in-memory only; a restored session
+            // starts with none, so the user re-approves after a restart.
+            allow_rules: Arc::new(StdMutex::new(std::collections::BTreeSet::new())),
+        }
+    }
+
+    /// Snapshot the serializable parts of this session for persistence.
+    fn to_persisted(&self) -> persistence::PersistedSession {
+        let attached_mcps = self
+            .attached_mcps
+            .lock()
+            .map(|guard| guard.iter().cloned().collect())
+            .unwrap_or_default();
+        let attached_library = self.attached_library.lock().ok().and_then(|g| g.clone());
+        persistence::PersistedSession {
+            id: self.id.clone(),
+            created_at: self.created_at,
+            conversation: self.conversation.clone(),
+            attached_mcps,
+            attached_library,
         }
     }
 
@@ -457,6 +598,7 @@ pub trait TurnDriver: Send + Sync + 'static {
         questioner: Option<Box<dyn UserQuestioner>>,
         observer: Option<Box<dyn TurnObserver>>,
         mcp: Option<McpRuntimeBundle>,
+        live_permission_mode: Arc<AtomicU8>,
     ) -> Result<TurnExecution, String>;
 }
 
@@ -542,6 +684,12 @@ pub struct ServerPrompter {
     pending: PendingPermissionStore,
     broadcaster: broadcast::Sender<SessionEvent>,
     next_id: Arc<AtomicU64>,
+    /// "Allow always" approvals granted earlier this session. Cloned (Arc)
+    /// from the session so the HTTP decision handler can add to it. When a
+    /// request's rule key is already present we auto-approve without ever
+    /// broadcasting a `permission_request` — that's what stops the hundreds
+    /// of repeat prompts for the same command.
+    allow_rules: Arc<StdMutex<std::collections::BTreeSet<String>>>,
 }
 
 impl ServerPrompter {
@@ -553,6 +701,18 @@ impl ServerPrompter {
 
 impl PermissionPrompter for ServerPrompter {
     fn decide(&mut self, request: &RuntimePermissionRequest) -> PermissionPromptDecision {
+        // Auto-approve if the user already chose "Allow always" for this
+        // command prefix / tool earlier in the session.
+        if let Some(key) = permission_rule_key(&request.tool_name, &request.input) {
+            let remembered = self
+                .allow_rules
+                .lock()
+                .map(|guard| guard.contains(&key))
+                .unwrap_or(false);
+            if remembered {
+                return PermissionPromptDecision::Allow;
+            }
+        }
         let request_id = self.next_request_id();
         let (tx, rx) = oneshot::channel::<PermissionPromptDecision>();
         let event = SessionEvent::PermissionRequest {
@@ -594,6 +754,54 @@ impl PermissionPrompter for ServerPrompter {
             }
         }
     }
+}
+
+/// Key under which an "Allow always" approval is remembered for a prompt.
+/// Per the chosen "per command prefix" granularity: a bash command keys on
+/// its leading program (`bash:git`, `bash:npm`) when it's a single simple
+/// segment, so approving `git status` also covers later `git` calls. Compound
+/// or redirected commands (anything with `&&`, `|`, `>`, `$(`, …) are too
+/// risky to generalize, so they're remembered by exact text instead. Every
+/// other tool keys on its name. `None` means "no stable key — never
+/// auto-approve".
+fn permission_rule_key(tool_name: &str, input: &str) -> Option<String> {
+    if tool_name != "bash" {
+        return Some(tool_name.to_string());
+    }
+    let command = serde_json::from_str::<JsonValue>(input)
+        .ok()
+        .and_then(|v| {
+            v.get("command")
+                .and_then(|c| c.as_str())
+                .map(str::to_string)
+        })?;
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if is_simple_single_segment(trimmed) {
+        let first = trimmed.split_whitespace().next()?;
+        let basename = first.rsplit(['/', '\\']).next().unwrap_or(first);
+        return Some(format!("bash:{basename}"));
+    }
+    Some(format!("bash:exact:{trimmed}"))
+}
+
+/// `true` when a bash command is a single segment with no shell operators —
+/// safe to generalize an "Allow always" to its leading program. Errs toward
+/// `false` (exact-match remembering) for anything containing chaining,
+/// pipes, redirects, subshells, backgrounding, or newlines, even inside
+/// quotes: over-conservative here only costs an extra prompt, never safety.
+fn is_simple_single_segment(command: &str) -> bool {
+    const OPERATORS: [&str; 8] = ["&&", "||", ";", "|", ">", "<", "$(", "`"];
+    if command.contains('\n') {
+        return false;
+    }
+    if OPERATORS.iter().any(|op| command.contains(op)) {
+        return false;
+    }
+    // A bare `&` (backgrounding) also makes the command compound.
+    !command.contains('&')
 }
 
 /// Async-to-sync bridge for the AskUser tool, structurally identical to
@@ -682,6 +890,7 @@ impl TurnDriver for DefaultTurnDriver {
         questioner: Option<Box<dyn UserQuestioner>>,
         observer: Option<Box<dyn TurnObserver>>,
         mcp: Option<McpRuntimeBundle>,
+        live_permission_mode: Arc<AtomicU8>,
     ) -> Result<TurnExecution, String> {
         // Set the process CWD to the configured workspace_root so file tools resolve
         // relative paths correctly and bash inherits it. This is process-wide so it
@@ -720,6 +929,7 @@ impl TurnDriver for DefaultTurnDriver {
                 observer,
                 mcp,
                 iter_cap,
+                live_permission_mode,
             ),
             Some(model) => {
                 let resolved = resolve_model_alias(model);
@@ -771,6 +981,7 @@ impl TurnDriver for DefaultTurnDriver {
                     observer,
                     mcp,
                     iter_cap,
+                    live_permission_mode,
                 )
             }
         }
@@ -790,6 +1001,7 @@ fn execute_turn<C: ApiClient>(
     observer: Option<Box<dyn TurnObserver>>,
     mcp: Option<McpRuntimeBundle>,
     iter_cap: usize,
+    live_permission_mode: Arc<AtomicU8>,
 ) -> Result<TurnExecution, String> {
     let observer_present = observer.is_some();
     let original_message_count = session.messages.len();
@@ -818,7 +1030,7 @@ fn execute_turn<C: ApiClient>(
         session,
         api_client,
         executor,
-        build_permission_policy(permission_mode),
+        build_permission_policy(permission_mode, live_permission_mode),
         agent_system_prompt(
             permission_mode,
             &workspace_root,
@@ -1933,6 +2145,11 @@ pub struct PermissionDecisionRequest {
     pub allowed: bool,
     #[serde(default)]
     pub reason: Option<String>,
+    /// When `true` on an allowed decision, remember the approval for this
+    /// command prefix / tool so identical prompts auto-approve for the rest
+    /// of the session (in-memory only). Ignored on denials.
+    #[serde(default)]
+    pub remember: Option<bool>,
 }
 
 /// Wire shape POSTed to `/sessions/{id}/questions/{qid}/answer`.
@@ -2400,6 +2617,7 @@ pub fn app(state: AppState) -> Router {
         .route("/providers", get(list_providers))
         .route("/providers/{name}", put(put_provider).delete(delete_provider))
         .route("/providers/{name}/models/live", get(provider_models_live))
+        .route("/browser/state", get(browser_state))
         .route("/workspace/tree", get(workspace_tree))
         .route("/workspace/file", get(workspace_file))
         .route("/workspace/picker", post(workspace_picker))
@@ -3371,6 +3589,7 @@ async fn create_session(
         .write()
         .await
         .insert(session_id.clone(), session);
+    state.persist_session(&session_id).await;
 
     (
         StatusCode::CREATED,
@@ -3480,7 +3699,7 @@ async fn send_message(
         }
     }
 
-    let (session_snapshot, broadcaster, turn_driver, attached_mcps_handle, cancel_signal) = {
+    let (session_snapshot, broadcaster, turn_driver, attached_mcps_handle, cancel_signal, allow_rules_handle) = {
         let mut sessions = state.sessions.write().await;
         let session = sessions
             .get_mut(&id)
@@ -3498,12 +3717,14 @@ async fn send_message(
         // the Arc so the observer + cancel_turn endpoint share state.
         session.cancel_signal.store(false, Ordering::Relaxed);
         let cancel_signal = session.cancel_signal.clone();
+        let allow_rules_handle = session.allow_rules.clone();
         (
             session_snapshot,
             session.events.clone(),
             state.turn_driver.clone(),
             attached_mcps_handle,
             cancel_signal,
+            allow_rules_handle,
         )
     };
     let turn_config = state.config.read().await.clone();
@@ -3529,6 +3750,7 @@ async fn send_message(
         pending: state.pending_permissions.clone(),
         broadcaster: broadcaster.clone(),
         next_id: state.next_permission_id.clone(),
+        allow_rules: allow_rules_handle,
     }));
     let questioner_for_turn: Option<Box<dyn UserQuestioner>> = Some(Box::new(ServerQuestioner {
         session_id: id.clone(),
@@ -3562,6 +3784,7 @@ async fn send_message(
         let blocking_prompter = prompter_for_turn;
         let blocking_questioner = questioner_for_turn;
         let blocking_observer = observer_for_turn;
+        let blocking_permission_mode = task_state.permission_mode.clone();
         let tools_snapshot = task_state
             .mcp_tools
             .lock()
@@ -3597,6 +3820,7 @@ async fn send_message(
                 blocking_questioner,
                 blocking_observer,
                 blocking_mcp,
+                blocking_permission_mode,
             )
         })
         .await
@@ -3611,6 +3835,9 @@ async fn send_message(
                         session.conversation = execution.session;
                     }
                 }
+                // Persist the completed turn (user + assistant + tool
+                // messages) so it survives a restart.
+                task_state.persist_session(&turn_session_id).await;
                 for event in execution.events {
                     let _ = task_broadcaster.send(event);
                 }
@@ -3634,6 +3861,10 @@ async fn send_message(
             session.current_turn = Some(handle);
         }
     }
+
+    // Persist the just-pushed user message so a crash mid-turn doesn't lose
+    // the prompt. The assistant reply is persisted again when the turn ends.
+    state.persist_session(&id).await;
 
     Ok(StatusCode::ACCEPTED)
 }
@@ -3682,6 +3913,7 @@ async fn compact_session_endpoint(
         session_id: id.clone(),
         session: snapshot.clone(),
     });
+    state.persist_session(&id).await;
 
     Ok(Json(CompactSessionResponse {
         removed_message_count: compact_result.removed_message_count,
@@ -4079,14 +4311,19 @@ async fn set_session_mcp_attached(
         .ok()
         .and_then(|g| g.clone());
     let cumulative_tokens = session_cumulative_tokens(&session.conversation.messages);
-    Ok(Json(SessionDetailsResponse {
+    let response = SessionDetailsResponse {
         id: session.id.clone(),
         created_at: session.created_at,
         session: session.conversation.clone(),
         attached_mcps,
         cumulative_tokens,
         attached_library,
-    }))
+    };
+    // Drop the read guard before persisting — `persist_session` takes its
+    // own read lock and we don't want to hold two across an await.
+    drop(sessions);
+    state.persist_session(&id).await;
+    Ok(Json(response))
 }
 
 async fn cancel_turn(
@@ -4172,6 +4409,7 @@ async fn delete_session_endpoint(
     // parked when the user deleted the session, dropping the sender lets
     // the runtime thread exit instead of hanging forever.
     reap_pending_for_session(&state, &id);
+    state.forget_session(&id).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -4210,6 +4448,26 @@ async fn decide_permission(
         return Err(gone(format!(
             "permission request `{request_id}` is no longer awaiting a decision"
         )));
+    }
+
+    // "Allow always": remember this command prefix / tool for the session so
+    // future identical prompts auto-approve. Derived from the parked request's
+    // own tool_name + input (the replay event), so it can't be spoofed by the
+    // POST body. In-memory only — never persisted.
+    if payload.allowed && payload.remember.unwrap_or(false) {
+        if let SessionEvent::PermissionRequest {
+            tool_name, input, ..
+        } = &entry.replay_event
+        {
+            if let Some(key) = permission_rule_key(tool_name, input) {
+                let sessions = state.sessions.read().await;
+                if let Some(session) = sessions.get(&session_id) {
+                    if let Ok(mut rules) = session.allow_rules.lock() {
+                        rules.insert(key);
+                    }
+                }
+            }
+        }
     }
 
     // Broadcast the decision so other UI tabs / observers stay in sync.
@@ -4419,6 +4677,11 @@ async fn update_config(
     let updated = {
         let mut config = state.config.write().await;
         if let Some(mode) = patch.permission_mode {
+            // Mirror into the live atomic so any in-flight turn re-reads the
+            // new mode at its next tool boundary (validated above).
+            if let Ok(parsed) = parse_permission_mode(&mode) {
+                state.permission_mode.store(parsed.as_u8(), Ordering::Relaxed);
+            }
             config.permission_mode = mode;
         }
         if let Some(model) = patch.model {
@@ -4584,15 +4847,25 @@ async fn delete_provider(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// `Eq` is intentionally not derived — the pricing fields are `f64`, which is
+// only `PartialEq`. Equality is still available for tests via `PartialEq`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LiveModel {
     pub id: String,
     /// Reported by the upstream when available (Anthropic returns it).
     /// Falls back to our static `context_window_for_model` if absent.
     pub context_window: Option<u32>,
+    /// USD per 1M input tokens from our static pricing table, when the model
+    /// id matches a known tier. `None` for unpriced/unknown models — provider
+    /// `/models` endpoints almost never return pricing, so this is best-effort.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_per_million: Option<f64>,
+    /// USD per 1M output tokens; same source/caveats as `input_per_million`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_per_million: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LiveModelsResponse {
     pub provider: String,
     pub fetched_from: String,
@@ -4701,12 +4974,179 @@ fn parse_live_models(provider: &str, payload: &JsonValue) -> Vec<LiveModel> {
             } else {
                 None
             };
+            // Merge in our static price table (substring match), so the picker
+            // can show $/1M alongside each model. Upstream `/models` responses
+            // don't carry pricing, hence the local lookup.
+            let price = pricing::lookup(&id);
             Some(LiveModel {
                 id,
                 context_window,
+                input_per_million: price.map(|p| p.input_per_million),
+                output_per_million: price.map(|p| p.output_per_million),
             })
         })
         .collect()
+}
+
+/// Live observation snapshot for the Browser pane. `available` is false when no
+/// browser MCP server has discovered its tools yet (so the pane shows a waiting
+/// state rather than an error). `screenshot` is a `data:` URL; `snapshot` is the
+/// (truncated) accessibility tree text; `url` is parsed from that snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub struct BrowserStateResponse {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Cap the a11y snapshot we ship to the pane — full trees on complex pages can
+/// be tens of KB and we poll this. The agent still sees the untruncated tree
+/// from its own tool call; the pane only needs a readable preview.
+const BROWSER_SNAPSHOT_MAX_CHARS: usize = 6000;
+
+/// `GET /browser/state` — drives the live Browser pane. Invokes the installed
+/// Playwright-MCP `browser_take_screenshot` + `browser_snapshot` tools *outside*
+/// a turn (both read-only, so interleaving with the agent's own calls is safe).
+/// Two MCP round-trips per call — fine for a local, human-paced poll.
+async fn browser_state(State(state): State<AppState>) -> Json<BrowserStateResponse> {
+    // Resolve the qualified tool names from the discovered-tools snapshot.
+    // Keyed on raw_name so it works regardless of the server's registered name.
+    let (screenshot_tool, snapshot_tool) = {
+        let guard = state.mcp_tools.lock();
+        match guard {
+            Ok(tools) => {
+                let find = |raw: &str| {
+                    tools
+                        .iter()
+                        .find(|t| t.raw_name == raw)
+                        .map(|t| t.qualified_name.clone())
+                };
+                (find("browser_take_screenshot"), find("browser_snapshot"))
+            }
+            Err(_) => (None, None),
+        }
+    };
+    // No discovered browser tools → not available yet (installed-but-starting,
+    // or not installed). The pane renders a waiting state.
+    let Some(screenshot_tool) = screenshot_tool else {
+        return Json(BrowserStateResponse {
+            available: false,
+            url: None,
+            snapshot: None,
+            screenshot: None,
+            error: None,
+        });
+    };
+
+    let mut manager = state.mcp_manager.lock().await;
+
+    // Screenshot (JPEG to keep the payload small).
+    let screenshot = match manager
+        .call_tool(&screenshot_tool, Some(serde_json::json!({ "type": "jpeg" })))
+        .await
+    {
+        Ok(response) => response
+            .result
+            .as_ref()
+            .and_then(extract_browser_screenshot),
+        Err(err) => {
+            return Json(BrowserStateResponse {
+                available: true,
+                url: None,
+                snapshot: None,
+                screenshot: None,
+                error: Some(err.to_string()),
+            });
+        }
+    };
+
+    // Accessibility snapshot → page URL + a truncated tree preview.
+    let (url, snapshot) = match snapshot_tool {
+        Some(tool) => match manager.call_tool(&tool, None).await {
+            Ok(response) => {
+                let text = response
+                    .result
+                    .as_ref()
+                    .map(extract_browser_text)
+                    .unwrap_or_default();
+                let url = parse_browser_page_url(&text);
+                let snapshot = if text.is_empty() {
+                    None
+                } else {
+                    Some(truncate_chars(&text, BROWSER_SNAPSHOT_MAX_CHARS))
+                };
+                (url, snapshot)
+            }
+            Err(_) => (None, None),
+        },
+        None => (None, None),
+    };
+
+    Json(BrowserStateResponse {
+        available: true,
+        url,
+        snapshot,
+        screenshot,
+        error: None,
+    })
+}
+
+/// Pull the first image content block out of an MCP tool result as a `data:` URL.
+fn extract_browser_screenshot(result: &runtime::McpToolCallResult) -> Option<String> {
+    result.content.iter().find_map(|block| {
+        if block.kind != "image" {
+            return None;
+        }
+        let data = block.data.get("data")?.as_str()?;
+        let mime = block
+            .data
+            .get("mimeType")
+            .and_then(|m| m.as_str())
+            .unwrap_or("image/png");
+        Some(format!("data:{mime};base64,{data}"))
+    })
+}
+
+/// Concatenate the text content blocks of an MCP tool result.
+fn extract_browser_text(result: &runtime::McpToolCallResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|block| {
+            if block.kind == "text" {
+                block.data.get("text").and_then(|t| t.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `@playwright/mcp` snapshots lead with a `- Page URL: <url>` line. Pull it out
+/// so the pane can show a URL bar without a separate tool call.
+fn parse_browser_page_url(snapshot_text: &str) -> Option<String> {
+    snapshot_text.lines().find_map(|line| {
+        let line = line.trim().trim_start_matches('-').trim();
+        line.strip_prefix("Page URL:")
+            .map(|rest| rest.trim().to_string())
+            .filter(|url| !url.is_empty())
+    })
+}
+
+/// Truncate on a char boundary, appending an elision marker when cut.
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(max_chars).collect();
+    format!("{truncated}\n… (truncated)")
 }
 
 async fn workspace_tree(
@@ -5217,6 +5657,7 @@ async fn set_session_library(
     if let Ok(mut guard) = handle.lock() {
         *guard = payload.library.clone();
     }
+    state.persist_session(&id).await;
     Ok(Json(SetSessionLibraryResponse {
         library: payload.library,
     }))
@@ -6433,12 +6874,16 @@ fn flatten_mcp_text(result: &runtime::McpToolCallResult) -> String {
 /// Build a `PermissionPolicy` whose per-tool floor comes from the static catalog
 /// (`mvp_tool_specs`). Without this seeding the policy treats every tool as needing
 /// `DangerFullAccess`, which is wrong for read-only tools like `read_file`.
-fn build_permission_policy(active_mode: PermissionMode) -> PermissionPolicy {
+fn build_permission_policy(
+    active_mode: PermissionMode,
+    live_mode: Arc<AtomicU8>,
+) -> PermissionPolicy {
     mvp_tool_specs()
         .into_iter()
-        .fold(PermissionPolicy::new(active_mode), |policy, spec| {
-            policy.with_tool_requirement(spec.name, spec.required_permission)
-        })
+        .fold(
+            PermissionPolicy::new(active_mode).with_live_mode(live_mode),
+            |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
+        )
 }
 
 fn builtin_tool_definitions() -> Vec<ToolDefinition> {
@@ -7082,6 +7527,7 @@ mod tests {
                 _questioner: Option<Box<dyn runtime::UserQuestioner>>,
                 _observer: Option<Box<dyn runtime::TurnObserver>>,
                 _mcp: Option<super::McpRuntimeBundle>,
+                _live_permission_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
             ) -> Result<TurnExecution, String> {
                 Err("runtime failed".to_string())
             }
@@ -7185,6 +7631,11 @@ mod tests {
             session_summarizer: None,
         };
 
+        let live_mode = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            super::parse_permission_mode(&config.permission_mode)
+                .unwrap()
+                .as_u8(),
+        ));
         let execution = tokio::task::spawn_blocking(move || {
             driver.run_turn(
                 "session-1".to_string(),
@@ -7196,6 +7647,7 @@ mod tests {
                 None,
                 None,
                 None,
+                live_mode,
             )
         })
         .await
@@ -7319,7 +7771,7 @@ mod tests {
             .json::<ServerConfig>()
             .await
             .expect("config response should parse");
-        assert_eq!(initial.permission_mode, "danger-full-access");
+        assert_eq!(initial.permission_mode, "prompt");
         assert!(initial.model.is_none());
 
         let patched = client
@@ -7363,6 +7815,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn patching_permission_mode_takes_effect_for_in_flight_turn() {
+        use std::sync::atomic::Ordering;
+
+        // Fix C: a turn captures the live permission-mode atomic, and a PATCH
+        // /config issued WHILE that turn runs must change authorization at the
+        // next tool boundary — without rebuilding the policy.
+        let state = AppState::with_config(ServerConfig {
+            permission_mode: "danger-full-access".to_string(),
+            ..ServerConfig::default()
+        });
+        // The handle send_message would hand to the running turn.
+        let live = state.permission_mode.clone();
+        assert_eq!(
+            live.load(Ordering::Relaxed),
+            runtime::PermissionMode::DangerFullAccess.as_u8()
+        );
+
+        // The in-flight turn's policy carries that live handle.
+        let policy = super::build_permission_policy(
+            runtime::PermissionMode::DangerFullAccess,
+            live.clone(),
+        );
+        // write_file (workspace-write floor) is allowed under danger-full-access.
+        assert!(matches!(
+            policy.authorize("write_file", r#"{"path":"a.txt","content":"x"}"#, None),
+            runtime::PermissionOutcome::Allow
+        ));
+
+        // Operator flips to read-only mid-turn via PATCH /config.
+        let _ = super::update_config(
+            axum::extract::State(state.clone()),
+            axum::Json(super::ConfigPatch {
+                permission_mode: Some("read-only".to_string()),
+                model: None,
+                workspace_root: None,
+                max_tool_iterations_per_turn: None,
+                max_session_tokens: None,
+                embedding_provider: None,
+                web_fetch_summarizer: None,
+                session_summarizer: None,
+            }),
+        )
+        .await
+        .expect("patch should succeed");
+
+        // The live atomic now reflects read-only...
+        assert_eq!(
+            live.load(Ordering::Relaxed),
+            runtime::PermissionMode::ReadOnly.as_u8()
+        );
+        // ...and the SAME, unrebuilt policy now denies the write.
+        assert!(matches!(
+            policy.authorize("write_file", r#"{"path":"a.txt","content":"x"}"#, None),
+            runtime::PermissionOutcome::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn permission_rule_key_keys_bash_on_program_and_others_by_name() {
+        use super::permission_rule_key;
+
+        // Simple single-segment bash keys on the leading program basename —
+        // approving one `git` call covers later `git` calls (the chosen
+        // "per command prefix" granularity).
+        assert_eq!(
+            permission_rule_key("bash", r#"{"command": "ls -la"}"#).as_deref(),
+            Some("bash:ls")
+        );
+        assert_eq!(
+            permission_rule_key("bash", r#"{"command": "git status"}"#).as_deref(),
+            Some("bash:git")
+        );
+        assert_eq!(
+            permission_rule_key("bash", r#"{"command": "/usr/bin/find . -name x"}"#).as_deref(),
+            Some("bash:find")
+        );
+        // Compound / redirected commands are NOT generalized — remembered by
+        // exact text so an approval can't smuggle in extra operators.
+        assert_eq!(
+            permission_rule_key("bash", r#"{"command": "ls && rm -rf build"}"#).as_deref(),
+            Some("bash:exact:ls && rm -rf build")
+        );
+        assert_eq!(
+            permission_rule_key("bash", r#"{"command": "cat f > out.txt"}"#).as_deref(),
+            Some("bash:exact:cat f > out.txt")
+        );
+        // Non-bash tools key on the tool name.
+        assert_eq!(
+            permission_rule_key("read_file", r#"{"path": "a.txt"}"#).as_deref(),
+            Some("read_file")
+        );
+        // Unparseable / empty bash input yields no stable key.
+        assert_eq!(permission_rule_key("bash", "not json"), None);
+        assert_eq!(permission_rule_key("bash", r#"{"command": "   "}"#), None);
+    }
+
+    #[test]
+    fn server_prompter_auto_approves_remembered_rule() {
+        use runtime::PermissionPrompter;
+
+        // Pre-seed an "Allow always" approval for `bash:ls`.
+        let mut allow = std::collections::BTreeSet::new();
+        allow.insert("bash:ls".to_string());
+        let allow_rules = Arc::new(StdMutex::new(allow));
+        let pending: super::PendingPermissionStore =
+            Arc::new(StdMutex::new(std::collections::HashMap::new()));
+        let (broadcaster, _rx) = tokio::sync::broadcast::channel(8);
+        let mut prompter = super::ServerPrompter {
+            session_id: "session-1".to_string(),
+            pending: pending.clone(),
+            broadcaster,
+            next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            allow_rules: allow_rules.clone(),
+        };
+
+        // A matching `ls` request auto-approves WITHOUT parking a pending
+        // request (so no UI prompt, no blocking wait).
+        let request = runtime::PermissionRequest {
+            tool_name: "bash".to_string(),
+            input: r#"{"command": "ls -la"}"#.to_string(),
+            current_mode: runtime::PermissionMode::Prompt,
+            required_mode: runtime::PermissionMode::ReadOnly,
+        };
+        assert!(matches!(
+            prompter.decide(&request),
+            runtime::PermissionPromptDecision::Allow
+        ));
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "remembered approval must not park a pending request"
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_concurrent_turns_on_same_session() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Barrier;
@@ -7384,6 +7970,7 @@ mod tests {
                 _questioner: Option<Box<dyn runtime::UserQuestioner>>,
                 _observer: Option<Box<dyn runtime::TurnObserver>>,
                 _mcp: Option<super::McpRuntimeBundle>,
+                _live_permission_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
             ) -> Result<TurnExecution, String> {
                 self.started.fetch_add(1, Ordering::SeqCst);
                 self.barrier.wait();
@@ -7463,6 +8050,7 @@ mod tests {
                 _questioner: Option<Box<dyn runtime::UserQuestioner>>,
                 _observer: Option<Box<dyn runtime::TurnObserver>>,
                 _mcp: Option<super::McpRuntimeBundle>,
+                _live_permission_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
             ) -> Result<TurnExecution, String> {
                 self.seen.lock().unwrap().push(config);
                 Ok(TurnExecution {
@@ -7543,7 +8131,7 @@ mod tests {
 
         let captured = seen.lock().unwrap().clone();
         assert_eq!(captured.len(), 2);
-        assert_eq!(captured[0].permission_mode, "danger-full-access");
+        assert_eq!(captured[0].permission_mode, "prompt");
         assert!(captured[0].model.is_none());
         assert_eq!(captured[1].permission_mode, "read-only");
         assert_eq!(captured[1].model.as_deref(), Some("deepseek"));
@@ -7571,6 +8159,7 @@ mod tests {
                 _questioner: Option<Box<dyn runtime::UserQuestioner>>,
                 _observer: Option<Box<dyn runtime::TurnObserver>>,
                 _mcp: Option<super::McpRuntimeBundle>,
+                _live_permission_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
             ) -> Result<TurnExecution, String> {
                 self.started.fetch_add(1, Ordering::SeqCst);
                 self.barrier.wait();
@@ -7748,6 +8337,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sessions_survive_restart_via_persistence() {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicU64 as StdAtomicU64, Ordering as StdOrdering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Unique state dir per test run so concurrent tests don't collide.
+        static SEQ: StdAtomicU64 = StdAtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let seq = SEQ.fetch_add(1, StdOrdering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "claw-server-sessions-{}-{}-{seq}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir state dir");
+        let path = dir.join("state.json");
+
+        // --- First "process": create a session, give it history, persist it.
+        let state = AppState::with_persistence(path.clone(), ServerConfig::default(), HashMap::new());
+        let id = state.allocate_session_id();
+        {
+            let mut session = super::Session::new(id.clone());
+            session
+                .conversation
+                .messages
+                .push(runtime::ConversationMessage::user_text("remember me across restarts"));
+            *session.attached_library.lock().unwrap() = Some("docs".to_string());
+            session
+                .attached_mcps
+                .lock()
+                .unwrap()
+                .insert("filesystem".to_string());
+            state.sessions.write().await.insert(id.clone(), session);
+        }
+        state.persist_session(&id).await;
+
+        // The on-disk file should exist now that the blocking write joined.
+        let sessions_dir = persistence::sessions_dir(&path);
+        let restored_disk = persistence::load_sessions(&sessions_dir);
+        assert_eq!(restored_disk.len(), 1, "exactly one session file on disk");
+
+        // --- Second "process": fresh AppState, same path. Starts empty,
+        // then restore_persisted_sessions pulls the session back in.
+        let restarted =
+            AppState::with_persistence(path.clone(), ServerConfig::default(), HashMap::new());
+        assert!(
+            restarted.sessions.read().await.is_empty(),
+            "fresh state has no in-memory sessions before restore"
+        );
+        restarted.restore_persisted_sessions().await;
+
+        {
+            let sessions = restarted.sessions.read().await;
+            let session = sessions.get(&id).expect("session restored into store");
+            assert_eq!(session.id, id);
+            assert_eq!(session.conversation.messages.len(), 1);
+            assert_eq!(
+                session.attached_library.lock().unwrap().as_deref(),
+                Some("docs")
+            );
+            assert!(session
+                .attached_mcps
+                .lock()
+                .unwrap()
+                .contains("filesystem"));
+        }
+
+        // next_session_id must advance past the restored id so a freshly
+        // allocated session can't collide with the one we just loaded.
+        let next_id = restarted.allocate_session_id();
+        assert_ne!(next_id, id, "allocator must not re-issue a restored id");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn permission_prompter_round_trips_through_sse_and_decision_endpoint() {
         use std::sync::Mutex as StdMutex;
 
@@ -7769,6 +8437,7 @@ mod tests {
                 _questioner: Option<Box<dyn runtime::UserQuestioner>>,
                 _observer: Option<Box<dyn runtime::TurnObserver>>,
                 _mcp: Option<super::McpRuntimeBundle>,
+                _live_permission_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
             ) -> Result<TurnExecution, String> {
                 let mut prompter = prompter.ok_or("prompter not provided")?;
                 let request = runtime::PermissionRequest {
@@ -8438,6 +9107,9 @@ mod tests {
         assert_eq!(models[0].id, "deepseek-chat");
         assert_eq!(models[0].context_window, None);
         assert_eq!(models[1].id, "deepseek-reasoner");
+        // Pricing is merged from the static table by substring ("deepseek").
+        assert_eq!(models[0].input_per_million, Some(0.27));
+        assert_eq!(models[0].output_per_million, Some(1.10));
     }
 
     #[test]
@@ -8453,6 +9125,76 @@ mod tests {
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].context_window, Some(1_000_000));
         assert_eq!(models[1].context_window, Some(200_000));
+    }
+
+    fn browser_content(kind: &str, pairs: &[(&str, serde_json::Value)]) -> runtime::McpToolCallContent {
+        runtime::McpToolCallContent {
+            kind: kind.to_string(),
+            data: pairs.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect(),
+        }
+    }
+
+    #[test]
+    fn extracts_browser_screenshot_as_data_url() {
+        use super::extract_browser_screenshot;
+        let result = runtime::McpToolCallResult {
+            content: vec![
+                browser_content("text", &[("text", serde_json::json!("ignored"))]),
+                browser_content(
+                    "image",
+                    &[
+                        ("data", serde_json::json!("QUJD")),
+                        ("mimeType", serde_json::json!("image/jpeg")),
+                    ],
+                ),
+            ],
+            structured_content: None,
+            is_error: None,
+            meta: None,
+        };
+        assert_eq!(
+            extract_browser_screenshot(&result).as_deref(),
+            Some("data:image/jpeg;base64,QUJD")
+        );
+        // No image block → None.
+        let textonly = runtime::McpToolCallResult {
+            content: vec![browser_content("text", &[("text", serde_json::json!("x"))])],
+            structured_content: None,
+            is_error: None,
+            meta: None,
+        };
+        assert_eq!(super::extract_browser_screenshot(&textonly), None);
+    }
+
+    #[test]
+    fn extracts_browser_text_and_parses_page_url() {
+        use super::{extract_browser_text, parse_browser_page_url};
+        let result = runtime::McpToolCallResult {
+            content: vec![browser_content(
+                "text",
+                &[(
+                    "text",
+                    serde_json::json!("- Page URL: https://example.com/x\n- Page Title: Example\n- heading \"Hi\""),
+                )],
+            )],
+            structured_content: None,
+            is_error: None,
+            meta: None,
+        };
+        let text = extract_browser_text(&result);
+        assert!(text.contains("Page Title: Example"));
+        assert_eq!(
+            parse_browser_page_url(&text).as_deref(),
+            Some("https://example.com/x")
+        );
+        assert_eq!(parse_browser_page_url("no url here"), None);
+    }
+
+    #[test]
+    fn truncate_chars_marks_elision() {
+        use super::truncate_chars;
+        assert_eq!(truncate_chars("hello", 10), "hello");
+        assert_eq!(truncate_chars("hello", 3), "hel\n… (truncated)");
     }
 
     #[tokio::test]
@@ -8498,6 +9240,7 @@ mod tests {
                 _questioner: Option<Box<dyn runtime::UserQuestioner>>,
                 _observer: Option<Box<dyn runtime::TurnObserver>>,
                 _mcp: Option<super::McpRuntimeBundle>,
+                _live_permission_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
             ) -> Result<TurnExecution, String> {
                 std::thread::sleep(Duration::from_secs(2));
                 Err("never finishes in time".to_string())

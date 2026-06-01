@@ -214,8 +214,11 @@ export function SettingsModal({
 
           {/* Content pane — render the existing panels verbatim. Each
               panel already owns its own scrolling so the modal stays
-              fixed-height. */}
-          <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
+              fixed-height. `minHeight: 0` is required so a panel's inner
+              `overflow:auto` actually engages instead of the flex child
+              growing to fit all content (which made the registry search
+              results overflow and overlap the area below). */}
+          <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" }}>
             {active === "models" && (
               <ModelsPanel
                 config={config}

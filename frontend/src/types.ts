@@ -530,6 +530,21 @@ export interface ProvidersResponse {
 export interface LiveModel {
   id: string;
   context_window: number | null;
+  /** USD per 1M input/output tokens from the server's static price table.
+   *  Absent when the model id matches no known pricing tier. */
+  input_per_million?: number | null;
+  output_per_million?: number | null;
+}
+
+/** Live observation snapshot for the Browser pane (GET /browser/state).
+ *  `available` is false when no browser MCP server has discovered tools yet. */
+export interface BrowserState {
+  available: boolean;
+  url?: string | null;
+  snapshot?: string | null;
+  /** `data:` URL of the latest screenshot, or absent if no page is open. */
+  screenshot?: string | null;
+  error?: string | null;
 }
 
 export interface LiveModelsResponse {

@@ -220,6 +220,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             AppState::with_config(config)
         }
     };
+    // Restore persisted chat sessions into the in-memory store before we
+    // start serving, so the sidebar shows prior history on first load.
+    // No-op when persistence is disabled.
+    state.restore_persisted_sessions().await;
     // Kick off MCP discovery in the background — it spawns subprocesses, calls
     // initialize + tools/list, and caches the result. We don't block startup on it.
     {

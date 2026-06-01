@@ -482,6 +482,9 @@ function RegistryEntryRow({
         borderRadius: 7,
         background: "var(--bg-panel)",
         overflow: "hidden",
+        // Don't let the row compress when the (now-bounded) results list is
+        // full — keep natural height so the list overflows and scrolls.
+        flexShrink: 0,
       }}
     >
       <button
@@ -899,6 +902,9 @@ function ServerRow({
         background: "var(--bg-panel)",
         overflow: "hidden",
         opacity: server.enabled ? 1 : 0.6,
+        // Keep natural height so a long configured-servers list scrolls
+        // instead of compressing the rows (same flex pitfall as the registry).
+        flexShrink: 0,
       }}
     >
       <button

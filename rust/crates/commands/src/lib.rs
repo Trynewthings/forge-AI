@@ -81,8 +81,10 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "status",
-        aliases: &[],
-        summary: "Show current session status",
+        // `/context` is a web-friendly alias — `/status` already surfaces the
+        // context-window fill, and Claude-Code users reach for `/context`.
+        aliases: &["context"],
+        summary: "Show current session status (alias: /context)",
         argument_hint: None,
         resume_supported: true,
         category: SlashCommandCategory::Core,

@@ -377,6 +377,15 @@ function ProviderRow({
     }
   }, [provider.name]);
 
+  // Auto-fetch live models the first time a configured provider is expanded,
+  // so the picker fills in without a manual "fetch" click. Unconfigured
+  // providers are skipped — their /models call would just 401.
+  useEffect(() => {
+    if (open && provider.configured && liveModels === null && !liveLoading && !liveError) {
+      void loadLive();
+    }
+  }, [open, provider.configured, liveModels, liveLoading, liveError, loadLive]);
+
   const save = async () => {
     setSaving(true);
     setError(null);
@@ -534,6 +543,8 @@ function ProviderRow({
                     active={activeModel === m.id}
                     onClick={() => onSetModel(m.id)}
                     ctx={m.context_window}
+                    inPrice={m.input_per_million}
+                    outPrice={m.output_per_million}
                   />
                 ))}
               </div>
@@ -607,12 +618,35 @@ function RecentChip({
   );
 }
 
-function ModelChip({ id, active, onClick, ctx }: { id: string; active: boolean; onClick: () => void; ctx?: number | null }) {
+function ModelChip({
+  id,
+  active,
+  onClick,
+  ctx,
+  inPrice,
+  outPrice,
+}: {
+  id: string;
+  active: boolean;
+  onClick: () => void;
+  ctx?: number | null;
+  inPrice?: number | null;
+  outPrice?: number | null;
+}) {
+  // Compact "$in/$out" per-1M label; only shown when both prices are known.
+  const priceLabel =
+    inPrice != null && outPrice != null ? `$${inPrice}/$${outPrice}` : null;
+  const titleParts = [id];
+  if (ctx) titleParts.push(`${ctx.toLocaleString()} ctx`);
+  if (priceLabel) titleParts.push(`${priceLabel} per 1M tok (in/out)`);
   return (
     <button
       onClick={onClick}
-      title={ctx ? `${id} · ${ctx.toLocaleString()} ctx` : id}
+      title={titleParts.join(" · ")}
       style={{
+        display: "inline-flex",
+        alignItems: "baseline",
+        gap: 5,
         padding: "3px 8px",
         borderRadius: 5,
         border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
@@ -625,6 +659,11 @@ function ModelChip({ id, active, onClick, ctx }: { id: string; active: boolean; 
       }}
     >
       {id}
+      {priceLabel && (
+        <span style={{ fontSize: 9.5, color: "var(--text-dim)", fontWeight: 500 }}>
+          {priceLabel}
+        </span>
+      )}
     </button>
   );
 }

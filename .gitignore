@@ -28,6 +28,10 @@ archive/
 # project workspace; never source-control these.
 .claw/
 
+# Playwright-MCP browser profile / output dir, created at runtime when the
+# built-in browser is used. Not source.
+.playwright-mcp/
+
 # Node deps inside the npm wrapper, if someone runs `npm install` there
 # to test locally
 npm-wrapper/node_modules/

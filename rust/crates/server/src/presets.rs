@@ -136,6 +136,22 @@ pub fn catalog() -> Vec<McpPreset> {
             user_inputs: vec![],
             prerequisites: vec![npx_prereq()],
         },
+        McpPreset {
+            id: "browser",
+            display_name: "Browser (Playwright)",
+            description: "Drive a real Chrome window: navigate, read pages via accessibility snapshots, click, and type. Runs headed with a dedicated persistent profile, so logins survive restarts and you can take over in the window. First launch downloads Chromium.",
+            category: "web",
+            homepage: Some("https://github.com/microsoft/playwright-mcp"),
+            command: "npx",
+            // No flags: @playwright/mcp defaults to a headed browser backed by a
+            // dedicated persistent profile (separate from your main Chrome), which
+            // is exactly the "logged-in, takeover-able" setup we want. `--isolated`
+            // would make it ephemeral — we deliberately omit it.
+            args_template: vec!["-y", "@playwright/mcp@latest"],
+            env_template: BTreeMap::new(),
+            user_inputs: vec![],
+            prerequisites: vec![npx_prereq()],
+        },
         // ---- path / DSN configuration ----
         McpPreset {
             id: "filesystem",
