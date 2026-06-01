@@ -77,6 +77,11 @@ export default function AppShell() {
   const [turnState, setTurnState] = useState<TurnState>("idle");
   const [turnError, setTurnError] = useState<string | null>(null);
   const [turnCancelled, setTurnCancelled] = useState(false);
+  // True once the agent has actually invoked a browser tool in the current
+  // turn. The Browser pane's live view polls ONLY when this is set, so an
+  // unrelated turn (or a session with no browser attached) never triggers the
+  // screenshot call that would otherwise launch a Chrome window.
+  const [browserUsedThisTurn, setBrowserUsedThisTurn] = useState(false);
   const turnCancelledRef = useRef(false);
   useEffect(() => {
     turnCancelledRef.current = turnCancelled;
@@ -344,6 +349,7 @@ export default function AppShell() {
           setError(null);
           setTurnError(null);
           setTurnCancelled(false);
+          setBrowserUsedThisTurn(false);
           break;
         case "user_message":
           needsRefresh = true;
@@ -359,7 +365,19 @@ export default function AppShell() {
             setStreamReasoning((p) => p + evt.text);
           }
           break;
-        case "tool_use":
+        case "tool_use": {
+          // Detect a browser MCP tool (`mcp__<server>__browser_*`) so the
+          // Browser pane only mirrors the page when the agent is actually
+          // driving it — never launching a window for unrelated turns.
+          const inner = evt.name.startsWith("mcp__")
+            ? (evt.name.split("__").pop() ?? "")
+            : "";
+          if (inner.startsWith("browser_")) setBrowserUsedThisTurn(true);
+          needsRefresh = true;
+          setStreamText("");
+          setStreamReasoning("");
+          break;
+        }
         case "tool_result":
         case "assistant_message":
           needsRefresh = true;
@@ -1172,7 +1190,7 @@ export default function AppShell() {
             tools={tools}
             mcpServers={mcpServers}
             onInstallBrowser={installBrowser}
-            turnActive={turnState === "running"}
+            browserActive={turnState === "running" && browserUsedThisTurn}
           />
         </div>
       )}

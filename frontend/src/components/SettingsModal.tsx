@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type {
   LibrarySummary,
   McpServerSummary,
@@ -8,6 +8,7 @@ import type {
   SkillSummary,
 } from "../types";
 import {
+  BookIcon,
   CloseIcon,
   CubeIcon,
   FileIcon,
@@ -15,13 +16,15 @@ import {
   SettingsIcon,
   SparkleIcon,
 } from "./Icons";
+import { fetchSessionUsage } from "../api";
+import type { SessionUsage } from "../types";
 import { ModelsPanel } from "./panels/ModelsPanel";
 import { SkillsPanel } from "./panels/SkillsPanel";
 import { McpPanel } from "./panels/McpPanel";
 import { RagPanel } from "./panels/RagPanel";
 import { SessionSummarizerForm } from "./panels/SummarizerForm";
 
-export type SettingsTab = "models" | "skills" | "mcp" | "rag" | "summarizer" | "config";
+export type SettingsTab = "models" | "skills" | "mcp" | "rag" | "usage" | "summarizer" | "config";
 
 interface Props {
   config: ServerConfig | null;
@@ -54,6 +57,7 @@ const TABS: TabDef[] = [
   { id: "skills", label: "Skills", icon: <SparkleIcon size={13} />, hint: "Installed + create + store" },
   { id: "mcp", label: "MCP", icon: <PlugIcon size={13} />, hint: "Servers + registry" },
   { id: "rag", label: "RAG", icon: <FileIcon size={13} />, hint: "Libraries + embedding" },
+  { id: "usage", label: "Usage", icon: <BookIcon size={13} />, hint: "Tokens + cost for this session" },
   { id: "summarizer", label: "Summarizer", icon: <SettingsIcon size={13} />, hint: "Absorb / handoff model" },
   { id: "config", label: "Config", icon: <SettingsIcon size={13} />, hint: "Read-only server state" },
 ];
@@ -248,6 +252,7 @@ export function SettingsModal({
                 onConfigChange={onConfigChange}
               />
             )}
+            {active === "usage" && <UsagePanel sessionId={activeSessionId} />}
             {active === "summarizer" && (
               <div
                 style={{
@@ -374,6 +379,134 @@ function ConfigReadout({ config }: { config: ServerConfig | null }) {
         These values are persisted under <code style={{ fontFamily: "var(--font-mono)" }}>~/.claw/state.json</code>.
         Edit them via the dedicated tabs above; this view is for diagnosing what the runtime sees.
       </div>
+    </div>
+  );
+}
+
+/** Settings → Usage: token counts + a rough cost estimate for the active
+ *  session. Fetches `/sessions/:id/usage` on open + via Refresh. */
+function UsagePanel({ sessionId }: { sessionId: SessionId | null }) {
+  const [usage, setUsage] = useState<SessionUsage | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    if (!sessionId) return;
+    setLoading(true);
+    setError(null);
+    try {
+      setUsage(await fetchSessionUsage(sessionId));
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }, [sessionId]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const fmt = (n: number) =>
+    n >= 1_000_000 ? `${(n / 1_000_000).toFixed(2)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
+
+  if (!sessionId) {
+    return (
+      <div style={{ padding: "32px 16px", textAlign: "center", color: "var(--text-dim)", fontSize: 12.5 }}>
+        No active session. Start or open a session to see its usage.
+      </div>
+    );
+  }
+
+  const cap = usage?.budget_tokens ?? null;
+  const fill = usage?.cumulative_tokens ?? 0;
+  const pct = cap && cap > 0 ? Math.min(100, Math.round((fill / cap) * 100)) : null;
+
+  return (
+    <div style={{ overflow: "auto", padding: "12px 16px", display: "flex", flexDirection: "column", gap: 14 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ fontSize: 12.5, fontWeight: 600, color: "var(--text)" }}>Session usage</span>
+        <span style={{ flex: 1 }} />
+        <button
+          onClick={load}
+          disabled={loading}
+          style={{
+            fontSize: 11,
+            color: "var(--text-muted)",
+            padding: "3px 8px",
+            border: "1px solid var(--border)",
+            borderRadius: 5,
+            background: "var(--bg-panel)",
+            cursor: loading ? "wait" : "pointer",
+          }}
+        >
+          {loading ? "…" : "Refresh"}
+        </button>
+      </div>
+      {error && (
+        <div style={{ color: "var(--err)", fontSize: 11, fontFamily: "var(--font-mono)" }}>{error}</div>
+      )}
+      {usage && (
+        <>
+          <UsageRow label="Model" value={usage.model ?? "(none)"} mono />
+          <UsageRow label="Turns" value={`${usage.turns}`} />
+          <UsageRow
+            label="Context fill"
+            value={
+              pct != null
+                ? `${fmt(fill)} / ${fmt(cap as number)} (${pct}%)`
+                : `${fmt(fill)} tokens`
+            }
+          />
+          {pct != null && (
+            <div style={{ height: 6, background: "var(--bg-panel)", borderRadius: 3, overflow: "hidden", border: "1px solid var(--border)" }}>
+              <div style={{ width: `${pct}%`, height: "100%", background: pct >= 90 ? "var(--err)" : "var(--accent)" }} />
+            </div>
+          )}
+          <UsageRow label="Total input tokens" value={fmt(usage.total_input_tokens)} />
+          <UsageRow label="Total output tokens" value={fmt(usage.total_output_tokens)} />
+          {usage.cache_read_tokens > 0 && (
+            <UsageRow label="Cache-read tokens" value={fmt(usage.cache_read_tokens)} />
+          )}
+          {usage.last_turn && (
+            <UsageRow
+              label="Last turn (in / out)"
+              value={`${fmt(usage.last_turn.input_tokens)} / ${fmt(usage.last_turn.output_tokens)}`}
+            />
+          )}
+          <UsageRow
+            label="Estimated cost"
+            value={
+              usage.estimated_cost_usd != null
+                ? `$${usage.estimated_cost_usd.toFixed(usage.estimated_cost_usd < 1 ? 4 : 2)}`
+                : "— (model not priced)"
+            }
+          />
+          {usage.input_per_million != null && usage.output_per_million != null && (
+            <div style={{ fontSize: 10.5, color: "var(--text-dim)" }}>
+              Price: ${usage.input_per_million}/${usage.output_per_million} per 1M tok (in/out).
+              Rough estimate from a local table; cache discounts not modeled.
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function UsageRow({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+  return (
+    <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+      <span style={{ fontSize: 11.5, color: "var(--text-muted)", minWidth: 150 }}>{label}</span>
+      <span
+        style={{
+          fontSize: 12.5,
+          color: "var(--text)",
+          fontFamily: mono ? "var(--font-mono)" : undefined,
+        }}
+      >
+        {value}
+      </span>
     </div>
   );
 }

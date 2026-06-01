@@ -2039,6 +2039,107 @@ pub fn session_cumulative_tokens(messages: &[runtime::ConversationMessage]) -> u
     total_output.saturating_add(latest_input)
 }
 
+/// Per-turn token counts for the most recent turn, surfaced to the Usage panel.
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnUsageView {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cache_read_input_tokens: u32,
+    pub cache_creation_input_tokens: u32,
+}
+
+/// Token + (rough) cost summary for one session — drives Settings → Usage.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionUsageResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub turns: usize,
+    /// Output + latest input (matches `/status`): the headline "context fill"
+    /// number, which avoids double-counting the re-sent history.
+    pub cumulative_tokens: u64,
+    /// Per-turn input summed across the session — the basis for cost, since
+    /// each turn re-bills the whole prompt.
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub cache_read_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_turn: Option<TurnUsageView>,
+    /// Rough USD estimate from the static price table (sum of per-turn cost);
+    /// `None` when the model isn't in the table. Cache discounts aren't modeled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_per_million: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_per_million: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u64>,
+}
+
+/// `GET /sessions/{id}/usage` — token counts + a rough cost estimate for the
+/// session, used by the Usage settings tab. Read-only; no LLM call.
+async fn session_usage(
+    State(state): State<AppState>,
+    Path(id): Path<SessionId>,
+) -> ApiResult<Json<SessionUsageResponse>> {
+    let (model, budget) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.model.clone().filter(|m| !m.is_empty()),
+            cfg.max_session_tokens,
+        )
+    };
+    let sessions = state.sessions.read().await;
+    let session = sessions
+        .get(&id)
+        .ok_or_else(|| not_found(format!("session `{id}` not found")))?;
+    let messages = &session.conversation.messages;
+
+    let mut total_input = 0u64;
+    let mut total_output = 0u64;
+    let mut cache_read = 0u64;
+    let mut turns = 0usize;
+    let mut cost = 0.0f64;
+    let mut any_cost = false;
+    let mut last_turn = None;
+    for msg in messages {
+        if let Some(u) = msg.usage.as_ref() {
+            turns += 1;
+            total_input = total_input.saturating_add(u64::from(u.input_tokens));
+            total_output = total_output.saturating_add(u64::from(u.output_tokens));
+            cache_read = cache_read.saturating_add(u64::from(u.cache_read_input_tokens));
+            if let Some(m) = model.as_deref() {
+                if let Some(c) =
+                    pricing::estimate_cost(m, u64::from(u.input_tokens), u64::from(u.output_tokens))
+                {
+                    cost += c;
+                    any_cost = true;
+                }
+            }
+            last_turn = Some(TurnUsageView {
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
+                cache_read_input_tokens: u.cache_read_input_tokens,
+                cache_creation_input_tokens: u.cache_creation_input_tokens,
+            });
+        }
+    }
+    let price = model.as_deref().and_then(pricing::lookup);
+    Ok(Json(SessionUsageResponse {
+        model,
+        turns,
+        cumulative_tokens: session_cumulative_tokens(messages),
+        total_input_tokens: total_input,
+        total_output_tokens: total_output,
+        cache_read_tokens: cache_read,
+        last_turn,
+        estimated_cost_usd: any_cost.then_some(cost),
+        input_per_million: price.map(|p| p.input_per_million),
+        output_per_million: price.map(|p| p.output_per_million),
+        budget_tokens: budget,
+    }))
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -2597,6 +2698,7 @@ pub fn app(state: AppState) -> Router {
         .route("/sessions/{id}/message", post(send_message))
         .route("/sessions/{id}/cancel", post(cancel_turn))
         .route("/sessions/{id}/compact", post(compact_session_endpoint))
+        .route("/sessions/{id}/usage", get(session_usage))
         .route("/sessions/{id}/absorb", post(absorb_sessions_endpoint))
         .route(
             "/sessions/{id}/mcp/{name}/attached",
@@ -6499,6 +6601,19 @@ fn mcp_catalog_section(mcp: &McpRuntimeBundle) -> Option<String> {
             ""
         };
         lines.push(format!(" - {name} ({count} tools){status}{first_hint}"));
+    }
+    // Browser-usage guidance: reading a page does not need a real browser, and
+    // the model can't see screenshots anyway — so don't reach for it to merely
+    // fetch a URL, and never pop a window open unprompted.
+    let has_browser = mcp
+        .tools_snapshot
+        .iter()
+        .any(|t| t.raw_name.starts_with("browser_"));
+    if has_browser {
+        lines.push(String::new());
+        lines.push(
+            "For a URL that only needs reading or summarizing, use the `WebFetch` tool — do not open the browser. Use the `browser_*` tools ONLY when the user explicitly asks to operate a page (log in, click, type, fill a form, or step through a multi-page flow). Opening a real browser window is intrusive, so never launch it unprompted.".to_string(),
+        );
     }
     Some(lines.join("\n"))
 }

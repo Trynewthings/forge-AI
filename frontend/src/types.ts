@@ -547,6 +547,27 @@ export interface BrowserState {
   error?: string | null;
 }
 
+/** Token + rough-cost summary for one session (GET /sessions/:id/usage),
+ *  shown in Settings → Usage. */
+export interface SessionUsage {
+  model?: string | null;
+  turns: number;
+  cumulative_tokens: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  cache_read_tokens: number;
+  last_turn?: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_input_tokens: number;
+    cache_creation_input_tokens: number;
+  } | null;
+  estimated_cost_usd?: number | null;
+  input_per_million?: number | null;
+  output_per_million?: number | null;
+  budget_tokens?: number | null;
+}
+
 export interface LiveModelsResponse {
   provider: string;
   fetched_from: string;

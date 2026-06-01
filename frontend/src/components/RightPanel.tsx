@@ -18,10 +18,11 @@ interface Props {
   /** One-click install of the `browser` preset. Resolves once installed +
    *  servers refreshed; rejects on failure. */
   onInstallBrowser: () => Promise<void>;
-  /** True while the agent is running a turn. The live view only auto-polls
-   *  then — when idle it never touches the browser, so closing the window
-   *  isn't resurrected by the panel. */
-  turnActive: boolean;
+  /** True only while the agent is actively driving the browser this turn
+   *  (it has called a `browser_*` tool). The live view auto-polls only then,
+   *  so it never launches a window for unrelated turns and never resurrects
+   *  one the user closed while idle. */
+  browserActive: boolean;
 }
 
 /** Right side panel — narrowed to per-turn introspection now that
@@ -32,7 +33,7 @@ interface Props {
  *    - Browser: reserved placeholder for the upcoming browser-observation
  *      pane (agent driving a real browser). Stub renders an empty state.
  */
-export function RightPanel({ config, tools, mcpServers, onInstallBrowser, turnActive }: Props) {
+export function RightPanel({ config, tools, mcpServers, onInstallBrowser, browserActive }: Props) {
   const [active, setActive] = useState<RightTab>("files");
 
   const tabs: TabDef<RightTab>[] = [
@@ -64,7 +65,7 @@ export function RightPanel({ config, tools, mcpServers, onInstallBrowser, turnAc
         {active === "files" && <FilesPanel workspaceRoot={config?.workspace_root ?? null} />}
         {active === "tools" && <ToolsPanel tools={tools} />}
         {active === "browser" && (
-          <BrowserPane servers={mcpServers} onInstall={onInstallBrowser} turnActive={turnActive} />
+          <BrowserPane servers={mcpServers} onInstall={onInstallBrowser} browserActive={browserActive} />
         )}
       </div>
     </div>
@@ -150,11 +151,11 @@ function findBrowserServer(servers: McpServerSummary[]): McpServerSummary | unde
 function BrowserPane({
   servers,
   onInstall,
-  turnActive,
+  browserActive,
 }: {
   servers: McpServerSummary[];
   onInstall: () => Promise<void>;
-  turnActive: boolean;
+  browserActive: boolean;
 }) {
   const server = findBrowserServer(servers);
   const [installing, setInstalling] = useState(false);
@@ -267,7 +268,7 @@ function BrowserPane({
         )}
       </Section>
       <Section title="Live view">
-        <BrowserLiveView ready={server.discovery_status === "ready"} turnActive={turnActive} />
+        <BrowserLiveView ready={server.discovery_status === "ready"} browserActive={browserActive} />
       </Section>
     </div>
   );
@@ -279,7 +280,7 @@ function BrowserPane({
  *  the user deliberately closed. When idle we freeze the last frame and offer
  *  a manual Refresh; if the user closes the window mid-turn (detected as
  *  about:blank after a real page) we stop reviving it. */
-function BrowserLiveView({ ready, turnActive }: { ready: boolean; turnActive: boolean }) {
+function BrowserLiveView({ ready, browserActive }: { ready: boolean; browserActive: boolean }) {
   const [state, setState] = useState<BrowserState | null>(null);
   const [showSnapshot, setShowSnapshot] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -300,15 +301,20 @@ function BrowserLiveView({ ready, turnActive }: { ready: boolean; turnActive: bo
     setState(s);
   }, []);
 
-  // A new turn means the agent may use the browser again — clear the latch.
+  // When browser activity (re)starts, reset the close latch AND the URL
+  // baseline — otherwise a stale non-blank URL from a previous turn would make
+  // the first about:blank frame look like a user-close and stop polling.
   useEffect(() => {
-    if (turnActive) closedRef.current = false;
-  }, [turnActive]);
+    if (browserActive) {
+      closedRef.current = false;
+      prevUrlRef.current = null;
+    }
+  }, [browserActive]);
 
   // Auto-poll ONLY during an active turn (and not after a user-close). When
   // idle we never touch the browser, so closing it stays closed.
   useEffect(() => {
-    if (!ready || !turnActive) return;
+    if (!ready || !browserActive) return;
     let cancelled = false;
     const tick = async () => {
       if (cancelled || closedRef.current) return;
@@ -324,7 +330,7 @@ function BrowserLiveView({ ready, turnActive }: { ready: boolean; turnActive: bo
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [ready, turnActive, fetchOnce]);
+  }, [ready, browserActive, fetchOnce]);
 
   const refresh = async () => {
     setRefreshing(true);
@@ -370,7 +376,7 @@ function BrowserLiveView({ ready, turnActive }: { ready: boolean; turnActive: bo
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         {note(
-          turnActive
+          browserActive
             ? "Capturing the agent's browser…"
             : "Idle. The view updates live while the agent uses the browser — or click Refresh to capture the current page.",
         )}
@@ -461,7 +467,7 @@ function BrowserLiveView({ ready, turnActive }: { ready: boolean; turnActive: bo
         </div>
       )}
       <div style={{ fontSize: 10, color: "var(--text-dim)", lineHeight: 1.5 }}>
-        {turnActive
+        {browserActive
           ? "Live — updating while the agent works."
           : "Showing the last frame. Closing the window ends it; click Refresh to capture again."}
       </div>

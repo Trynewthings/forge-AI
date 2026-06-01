@@ -6,7 +6,7 @@ The Rust workspace is the current main product surface. The `claw` binary provid
 
 ## Current status
 
-- **Version:** `0.2.0`
+- **Version:** `0.2.1`
 - **Release stage:** initial public release, source-build distribution
 - **Primary implementation:** Rust workspace in this repository
 - **Platform focus:** macOS and Linux developer workstations
@@ -115,6 +115,7 @@ The Rust workspace is the active product implementation. It currently includes t
 
 ## Release notes
 
+- 0.2.1 release notes: [`docs/releases/0.2.1.md`](docs/releases/0.2.1.md)
 - 0.2.0 release notes: [`docs/releases/0.2.0.md`](docs/releases/0.2.0.md)
 - Draft 0.1.0 release notes: [`docs/releases/0.1.0.md`](docs/releases/0.1.0.md)
 

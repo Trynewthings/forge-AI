@@ -417,6 +417,15 @@ export async function fetchBrowserState(): Promise<BrowserState> {
   return jsonOrThrow(await fetch(`${BASE}/browser/state`));
 }
 
+/** Token + cost usage summary for one session (Settings → Usage). */
+export async function fetchSessionUsage(
+  sessionId: SessionId,
+): Promise<import("./types").SessionUsage> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}/usage`),
+  );
+}
+
 export async function checkPresetPrereqs(
   id: string,
 ): Promise<PrereqCheckResponse> {

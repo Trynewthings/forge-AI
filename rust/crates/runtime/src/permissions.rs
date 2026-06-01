@@ -249,7 +249,10 @@ const BROWSER_READ_TOOLS: &[&str] = &[
 /// `@playwright/mcp` tools that interact with / mutate the page (or, on a
 /// logged-in profile, act as the user). These require `workspace-write`, so
 /// they're gated above plain reads. Anything not listed in either set falls
-/// through to the unmapped-MCP default (`danger-full-access`).
+/// through to the unmapped-MCP default (`danger-full-access`) — which is where
+/// arbitrary-code tools (`browser_evaluate`, `browser_run_code_unsafe`) and
+/// ones with system/network reach (`browser_install`, `browser_network_request`)
+/// deliberately land: page interaction is workspace-write, "run anything" is not.
 const BROWSER_WRITE_TOOLS: &[&str] = &[
     "browser_click",
     "browser_type",
@@ -260,11 +263,9 @@ const BROWSER_WRITE_TOOLS: &[&str] = &[
     "browser_hover",
     "browser_drag",
     "browser_file_upload",
-    "browser_evaluate",
     "browser_tabs",
     "browser_handle_dialog",
     "browser_close",
-    "browser_install",
     "browser_pdf_save",
 ];
 
@@ -733,11 +734,11 @@ mod tests {
                 "expected read-only for `{tool}`"
             );
         }
-        // Mutating browser tools resolve to WorkspaceWrite.
+        // Page-interaction browser tools resolve to WorkspaceWrite.
         for tool in [
             "mcp__browser__browser_click",
             "mcp__browser__browser_type",
-            "mcp__browser__browser_evaluate",
+            "mcp__browser__browser_fill_form",
             "mcp__browser__browser_file_upload",
         ] {
             assert_eq!(
@@ -746,15 +747,22 @@ mod tests {
                 "expected workspace-write for `{tool}`"
             );
         }
-        // Unknown / non-browser MCP tools keep the conservative default.
-        assert_eq!(
-            policy.effective_required_mode("mcp__browser__browser_unknown_future", "{}"),
-            PermissionMode::DangerFullAccess
-        );
-        assert_eq!(
-            policy.effective_required_mode("mcp__postgres__query", "{}"),
-            PermissionMode::DangerFullAccess
-        );
+        // Arbitrary-code / system-reach browser tools, unknown browser tools,
+        // and non-browser MCP tools all keep the conservative danger default.
+        for tool in [
+            "mcp__browser__browser_evaluate",
+            "mcp__browser__browser_run_code_unsafe",
+            "mcp__browser__browser_network_request",
+            "mcp__browser__browser_install",
+            "mcp__browser__browser_unknown_future",
+            "mcp__postgres__query",
+        ] {
+            assert_eq!(
+                policy.effective_required_mode(tool, "{}"),
+                PermissionMode::DangerFullAccess,
+                "expected danger-full-access for `{tool}`"
+            );
+        }
     }
 
     #[test]
